@@ -1,8 +1,15 @@
 import logging
 import asyncio
+import os
+from threading import Thread
 from datetime import datetime, timedelta
+from flask import Flask
+
+# Telegram Imports
 from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Database Imports
 from pymongo import MongoClient
 
 # --- CONFIGURATION ---
@@ -24,6 +31,21 @@ courses_col = db['courses']
 users_col = db['users']
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- FAKE WEB SERVER FOR RENDER ---
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web_server)
+    t.start()
 
 # --- HELPERS ---
 
@@ -395,6 +417,9 @@ async def get_stats(update, context):
     await update.message.reply_text(f"📊 <b>Stats</b>\nUsers: {u}\nPremium: {p}\nCourses: {c}")
 
 def main():
+    # START THE FAKE WEB SERVER
+    keep_alive()
+    
     app = Application.builder().token(BOT_TOKEN).build()
     
     # Commands
@@ -419,4 +444,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
