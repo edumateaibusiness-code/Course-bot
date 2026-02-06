@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import os
+import html
 from threading import Thread
 from datetime import datetime, timedelta
 from flask import Flask
@@ -25,19 +26,21 @@ CONTACT_ADMIN = "@mineheartO"
 PREMIUM_PRICE = "499"
 
 # --- DATABASE SETUP ---
+# Using PyMongo (Synchronous)
 client = MongoClient(MONGO_URI)
 db = client['course_bot_db']
 courses_col = db['courses']
 users_col = db['users']
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- FAKE WEB SERVER FOR RENDER ---
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is running and Auto-Delete is active!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -53,10 +56,6 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def get_user_status(user_id):
-    """
-    Returns: 'admin', 'premium', 'referral_qualified', or 'free'
-    Handles 24-hour expiration for referrals.
-    """
     if is_admin(user_id): return 'admin'
     
     user = users_col.find_one({"user_id": user_id})
@@ -65,12 +64,9 @@ def get_user_status(user_id):
     if user.get("authorized", False):
         return 'premium'
     
-    # --- REFERRAL EXPIRATION LOGIC ---
-    # Check if referral qualification has expired
+    # Check Referral Expiry
     reset_time = user.get("referral_reset_time")
-    
     if reset_time and datetime.now() > reset_time:
-        # Expired! Reset count and remove timer
         users_col.update_one(
             {"user_id": user_id},
             {
@@ -80,14 +76,10 @@ def get_user_status(user_id):
         )
         return 'free'
 
-    # Check referrals (Threshold: 3)
     if user.get("referral_count", 0) >= 3:
-        # If they qualify but don't have an expiration time set (legacy/edge case), set it now
         if not reset_time:
-             # This sets the timer starting NOW if they somehow have 3 refs but no timer
              expiry = datetime.now() + timedelta(hours=24)
              users_col.update_one({"user_id": user_id}, {"$set": {"referral_reset_time": expiry}})
-        
         return 'referral_qualified'
         
     return 'free'
@@ -96,13 +88,19 @@ async def is_subscribed(context, user_id):
     try:
         member = await context.bot.get_chat_member(chat_id=FORCE_JOIN_CHANNEL, user_id=user_id)
         return member.status not in [constants.ChatMemberStatus.LEFT, constants.ChatMemberStatus.BANNED]
-    except:
+    except Exception as e:
+        # Log error but fail open (allow access) to prevent blocking everyone if bot isn't admin
+        logger.error(f"Force Join Error: {e}")
         return True 
 
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job to delete messages after a delay"""
+    job = context.job
     try:
-        await context.bot.delete_message(chat_id=context.job.chat_id, message_id=context.job.data)
-    except: pass
+        await context.bot.delete_message(chat_id=job.chat_id, message_id=job.data)
+        logger.info(f"Auto-deleted message {job.data} in chat {job.chat_id}")
+    except Exception as e:
+        logger.warning(f"Failed to auto-delete message: {e}")
 
 # --- HANDLERS ---
 
@@ -111,63 +109,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     referrer_id = None
     
-    # Check if existing user
     existing_user = users_col.find_one({"user_id": user.id})
     
-    # --- REFERRAL LOGIC (Only for new users) ---
+    # Referral Logic
     if not existing_user and args:
         try:
             referrer_id = int(args[0])
             if referrer_id != user.id:
-                # Update Referrer
                 referrer_data = users_col.find_one({"user_id": referrer_id})
-                
                 if referrer_data:
-                    # Increment count
-                    users_col.update_one(
-                        {"user_id": referrer_id},
-                        {"$inc": {"referral_count": 1}}
-                    )
-                    
-                    # Fetch updated count
+                    users_col.update_one({"user_id": referrer_id}, {"$inc": {"referral_count": 1}})
                     new_count = referrer_data.get("referral_count", 0) + 1
-                    msg = f"🎉 <b>New Referral!</b>\nYou have referred {new_count} users."
                     
-                    # Check if they just hit the threshold
+                    msg = f"🎉 <b>New Referral!</b>\nYou have referred {new_count} users."
                     if new_count == 3:
-                        # SET EXPIRATION TIMER (24 Hours from now)
                         expiry_time = datetime.now() + timedelta(hours=24)
                         users_col.update_one(
                             {"user_id": referrer_id},
                             {"$set": {"referral_reset_time": expiry_time}}
                         )
                         msg += "\n\n🎁 <b>Congratulations!</b> You unlocked 3 sample videos per course!\n⏳ <b>Valid for 24 Hours only.</b>"
-                    
                     elif new_count < 3:
                         msg += f"\nNeed {3 - new_count} more to unlock videos!"
                     
-                    elif new_count > 3:
-                         msg += "\n(You remain qualified for the 24h period)"
-
-                    await context.bot.send_message(referrer_id, msg, parse_mode=constants.ParseMode.HTML)
+                    try:
+                        await context.bot.send_message(referrer_id, msg, parse_mode=constants.ParseMode.HTML)
+                    except: pass # Referrer might have blocked bot
         except Exception as e:
             logging.error(f"Referral error: {e}")
 
-    # Register/Update User
+    # Register User
     user_data = {
         "user_id": user.id,
         "username": user.username,
         "first_name": user.first_name
     }
-    # Only set referred_by if new
     if not existing_user and referrer_id:
         user_data["referred_by"] = referrer_id
-        
     users_col.update_one({"user_id": user.id}, {"$set": user_data}, upsert=True)
 
-    # --- FORCE JOIN CHECK ---
+    # Force Join
     ref_link = f"https://t.me/{context.bot.username}?start={user.id}"
-    
     if not await is_subscribed(context, user.id):
         keyboard = [
             [InlineKeyboardButton("Join Channel 📢", url=f"https://t.me/{FORCE_JOIN_CHANNEL.replace('@','')}")],
@@ -179,17 +161,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- WELCOME MESSAGE ---
-    status = get_user_status(user.id) # Re-check status to handle expiration
-    
-    msg = f"<b>👋 Welcome {user.first_name}!</b>\n\n"
+    # Welcome Message
+    status = get_user_status(user.id)
+    # ⚠️ FIX: Escape name to prevent HTML crash
+    safe_name = html.escape(user.first_name)
+    msg = f"<b>👋 Welcome {safe_name}!</b>\n\n"
     
     if status == 'admin':
         msg += (
             "⭐ <b>ADMIN PANEL ACTIVE</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "➕ <code>/add [Name] [Links]</code>\n"
-            "📹 <b>To Add Videos:</b> Reply to video with <code>/save [Name]</code>\n"
+            "📹 Reply video with <code>/save [Name]</code>\n"
             "🗑️ <code>/del_course [Name]</code>\n"
             "🔓 <code>/authorize [ID]</code>\n"
             "❌ <code>/remove [ID]</code>\n"
@@ -198,11 +181,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 <code>/stats</code>\n"
         )
     else:
-        # User Dashboard
         user_doc = users_col.find_one({"user_id": user.id})
         current_refs = user_doc.get("referral_count", 0)
-        
-        # Calculate time remaining if qualified
         expiry_info = ""
         if status == 'referral_qualified':
             reset_time = user_doc.get("referral_reset_time")
@@ -242,8 +222,6 @@ async def add_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         courses_col.update_one({"name": name}, {"$addToSet": {"links": {"$each": links}}}, upsert=True)
         await update.message.reply_text(f"✅ <b>{name.upper()}</b> Links Saved!")
-        
-        # Notify Premium Users
         await notify_users(context, name)
         
     except Exception as e:
@@ -297,8 +275,6 @@ async def del_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("🔍 Course not found.")
 
-# --- USER MANAGEMENT ---
-
 async def authorize_user(update, context):
     if not is_admin(update.effective_user.id): return
     try:
@@ -324,27 +300,25 @@ async def premium_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{i}. <code>{u['user_id']}</code> (@{u.get('username')})\n"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-# --- CORE LOGIC (SEARCH) ---
+# --- CORE LOGIC (SEARCH & AUTO DELETE) ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await is_subscribed(context, user.id): return
     
     query = update.message.text.lower().strip()
-    status = get_user_status(user.id) # Handles expiration logic internally
+    status = get_user_status(user.id)
     
-    # 1. Check if course exists
-    course = courses_col.find_one({"name": query})
+    # Fuzzy Search (Contains)
+    course = courses_col.find_one({"name": {"$regex": query, "$options": "i"}})
     
     if not course:
         await update.message.reply_text("🔍 Course not found. Try /courses or check spelling.")
         return
 
-    # 2. Logic based on Status
-    
     # CASE A: PREMIUM USER (Links + Videos)
     if status in ['premium', 'admin']:
-        response_text = f"✅ <b>{query.upper()}</b> (Premium)\n\n"
+        response_text = f"✅ <b>{course['name'].upper()}</b> (Premium)\n\n"
         
         if "links" in course and course['links']:
             response_text += "\n".join([f"🔗 {l}" for l in course['links']])
@@ -355,6 +329,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response_text + "\n\n⚠️ <i>Auto-delete in 2 mins</i>", 
             parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True
         )
+        # ⚠️ FIX: Schedule Auto-Delete for Premium
         context.job_queue.run_once(delete_message_job, 120, chat_id=update.effective_chat.id, data=sent.message_id)
         return
 
@@ -366,21 +341,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("😕 Sorry, no videos uploaded for this course yet.\nAsk admin to add videos.")
             return
             
-        await update.message.reply_text(f"🎁 <b>Referral Bonus Active!</b>\nSending 3 sample videos for {query.upper()}...")
+        await update.message.reply_text(f"🎁 <b>Referral Bonus Active!</b>\nSending 3 sample videos for {course['name'].upper()}...\n⚠️ <i>Videos will auto-delete in 2 mins!</i>", parse_mode=constants.ParseMode.HTML)
         
-        for vid_id in videos[:3]: # Limit to 3
+        for vid_id in videos[:3]:
             try:
-                await context.bot.send_video(chat_id=user.id, video=vid_id, caption=f"🎥 {query.upper()} Sample")
+                # ⚠️ FIX: Send Video AND Schedule Auto-Delete
+                sent_vid = await context.bot.send_video(chat_id=user.id, video=vid_id, caption=f"🎥 {course['name'].upper()} Sample")
+                context.job_queue.run_once(delete_message_job, 120, chat_id=user.id, data=sent_vid.message_id)
             except Exception as e:
                 logging.error(f"Failed to send video: {e}")
         
         await update.message.reply_text(f"💎 Want full access & links?\nBuy Premium: <b>{PREMIUM_PRICE}/-</b>\nContact: {CONTACT_ADMIN}", parse_mode=constants.ParseMode.HTML)
 
-    # CASE C: FREE USER (Restriction Message)
+    # CASE C: FREE USER
     else:
         ref_link = f"https://t.me/{context.bot.username}?start={user.id}"
         await update.message.reply_text(
-            f"🚫 <b>Premium Required for {query.upper()}</b>\n\n"
+            f"🚫 <b>Premium Required for {course['name'].upper()}</b>\n\n"
             f"💰 <b>Price:</b> {PREMIUM_PRICE}/-\n"
             f"👤 <b>Buy Here:</b> {CONTACT_ADMIN}\n\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -396,18 +373,25 @@ async def list_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📚 <b>Available Courses:</b>\n\n" + "\n".join([f"• <code>{c['name'].upper()}</code>" for c in courses])
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
-# --- STANDARD ADMIN TOOLS ---
 async def broadcast(update, context):
     if not is_admin(update.effective_user.id): return
     msg_text = " ".join(context.args)
     if not msg_text: return
     is_pin = update.message.text.startswith('/pin')
     users = users_col.find({})
+    
+    status = await update.message.reply_text("🚀 Starting Broadcast...")
+    
+    count = 0
     for u in users:
         try:
             s = await context.bot.send_message(u['user_id'], f"📢 <b>UPDATE:</b>\n\n{msg_text}", parse_mode=constants.ParseMode.HTML)
             if is_pin: await context.bot.pin_chat_message(u['user_id'], s.message_id)
+            count += 1
+            await asyncio.sleep(0.05) # Anti-flood
         except: pass
+    
+    await status.edit_text(f"✅ Broadcast Complete to {count} users.")
 
 async def get_stats(update, context):
     if not is_admin(update.effective_user.id): return
@@ -417,12 +401,11 @@ async def get_stats(update, context):
     await update.message.reply_text(f"📊 <b>Stats</b>\nUsers: {u}\nPremium: {p}\nCourses: {c}")
 
 def main():
-    # START THE FAKE WEB SERVER
+    # START FAKE SERVER
     keep_alive()
     
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_course))
     app.add_handler(CommandHandler("save", save_video))
@@ -435,11 +418,10 @@ def main():
     app.add_handler(CommandHandler("courses", list_courses))
     app.add_handler(CommandHandler("stats", get_stats))
     
-    # Message Handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VIDEO & filters.CaptionRegex(r"^/save"), save_video))
     
-    print("🚀 Affanoi Courses Bot 2.0 (With 24h Expiry) is LIVE...")
+    print("🚀 Affanoi Courses Bot 2.0 (Final Stable) is LIVE...")
     app.run_polling()
 
 if __name__ == "__main__":
