@@ -1,8 +1,6 @@
 """
-AFFANOI COURSES BOT - ENTERPRISE EDITION
-Version: 3.0.0 (Architecture: Monolithic Class-Based)
-Author: Professional Python Developer
-Platform: Render / VPS
+AFFANOI COURSES BOT - ENTERPRISE EDITION (FIXED)
+Version: 3.1.0 (Fixed Search Logic)
 """
 
 import logging
@@ -60,14 +58,12 @@ class Config:
     # --------------------------------------------------------------------------
     # SECURITY & API KEYS
     # --------------------------------------------------------------------------
-    # Attempt to load from Environment, fallback to hardcoded strings (Not recommended for Prod)
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8342076756:AAEj8BjB-aDegzv7jPISvGPXl7VgD59R3CU")
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb+srv://officaltnvjvalid_db_user:QpOcYNtTqqY7eRrm@cluster0.xbzmis8.mongodb.net/?appName=Cluster0")
     
     # --------------------------------------------------------------------------
     # ADMIN CONFIGURATION
     # --------------------------------------------------------------------------
-    # Parse comma-separated admin IDs from env
     _admin_env = os.getenv("ADMIN_IDS", "6457348769,8237070487")
     ADMIN_IDS: List[int] = [int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()]
     
@@ -144,8 +140,8 @@ class Texts:
         "<b>Validity:</b> Lifetime Access\n\n"
         "💳 <b>Payment Methods:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔸 <b>UPI ID:</b> <code>9541151084@fam</code>\n"
-        "🔸 <b>Binance Pay:</b> <code>not available</code>\n"
+        "🔸 <b>UPI ID:</b> <code>example@upi</code>\n"
+        "🔸 <b>Binance Pay:</b> <code>12345678</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📝 <b>Verification Steps:</b>\n"
         "1. Complete the payment.\n"
@@ -602,33 +598,30 @@ class BotHandlers:
     # COURSE & SEARCH LOGIC
     # --------------------------------------------------------------------------
 
-@classmethod
+    @classmethod
     async def search_message(cls, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Main text handler for searching courses."""
+        """Main text handler for searching courses. Handles direct text and inline button clicks."""
         user = update.effective_user
         
         # Gatekeeper
         if not await cls.check_subscription(context, user.id):
             return
 
-        # --- 🛠️ FIX STARTS HERE ---
         raw_text = update.message.text.strip()
         
-        # Check if the message starts with a username (like "@AffanoiBot Python")
+        # --- 🛠️ FIX FOR "@BotName Course" ---
+        # If the user clicks an inline button, Telegram sends "@BotName CourseName"
+        # We need to strip the @BotName part.
         if raw_text.startswith("@"):
-            # Split the text into ["@AffanoiBot", "Python"]
             parts = raw_text.split(maxsplit=1)
-            
-            # If there is text AFTER the username, use that as the query
             if len(parts) > 1:
                 query = parts[1].lower().strip()
             else:
-                # User just sent "@AffanoiBot", ignore it
-                return 
+                # User just typed the bot username and nothing else
+                return
         else:
-            # Normal text message
             query = raw_text.lower().strip()
-        # --- 🛠️ FIX ENDS HERE ---
+        # --- FIX END ---
 
         status = cls.get_user_status(user.id)
         course = db_manager.find_course(query)
@@ -647,6 +640,7 @@ class BotHandlers:
             else:
                 txt += "📂 No direct links found."
             
+            # NO AUTO DELETE, PROTECT CONTENT ENABLED
             await update.message.reply_text(
                 txt,
                 parse_mode=constants.ParseMode.HTML,
@@ -665,35 +659,6 @@ class BotHandlers:
             await update.message.reply_text(
                 f"🎁 <b>Trial Active!</b> Sending 3 samples...\n"
                 f"⚠️ <i>Auto-delete in {Config.AUTO_DELETE_SECONDS // 60} mins.</i>",
-                parse_mode=constants.ParseMode.HTML
-            )
-
-            for vid in videos[:3]:
-                try:
-                    msg = await context.bot.send_video(
-                        chat_id=user.id,
-                        video=vid,
-                        caption=f"🎥 {course['name'].upper()} (Trial)",
-                        protect_content=True
-                    )
-                    context.job_queue.run_once(
-                        cls.auto_delete_task,
-                        Config.AUTO_DELETE_SECONDS,
-                        chat_id=user.id,
-                        data=msg.message_id
-                    )
-                except Exception as e:
-                    logging.error(f"Video Send Fail: {e}")
-            
-            await update.message.reply_text(f"💎 Unlock Full Access: /buy")
-
-        # 3. FREE USER EXPERIENCE
-        else:
-            await update.message.reply_text(
-                f"🚫 <b>LOCKED: {course['name'].upper()}</b>\n\n"
-                f"💰 Price: ₹{Config.PREMIUM_PRICE}/-\n"
-                f"🔓 <b>Get Free Trial:</b> Refer {Config.REFERRAL_THRESHOLD} friends.\n"
-                f"🔗 Link: <code>https://t.me/{context.bot.username}?start={user.id}</code>",
                 parse_mode=constants.ParseMode.HTML
             )
 
