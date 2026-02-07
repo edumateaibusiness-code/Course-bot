@@ -602,7 +602,7 @@ class BotHandlers:
     # COURSE & SEARCH LOGIC
     # --------------------------------------------------------------------------
 
-    @classmethod
+@classmethod
     async def search_message(cls, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Main text handler for searching courses."""
         user = update.effective_user
@@ -611,9 +611,26 @@ class BotHandlers:
         if not await cls.check_subscription(context, user.id):
             return
 
-        query = update.message.text.lower().strip()
-        status = cls.get_user_status(user.id)
+        # --- 🛠️ FIX STARTS HERE ---
+        raw_text = update.message.text.strip()
         
+        # Check if the message starts with a username (like "@AffanoiBot Python")
+        if raw_text.startswith("@"):
+            # Split the text into ["@AffanoiBot", "Python"]
+            parts = raw_text.split(maxsplit=1)
+            
+            # If there is text AFTER the username, use that as the query
+            if len(parts) > 1:
+                query = parts[1].lower().strip()
+            else:
+                # User just sent "@AffanoiBot", ignore it
+                return 
+        else:
+            # Normal text message
+            query = raw_text.lower().strip()
+        # --- 🛠️ FIX ENDS HERE ---
+
+        status = cls.get_user_status(user.id)
         course = db_manager.find_course(query)
         
         if not course:
@@ -630,7 +647,6 @@ class BotHandlers:
             else:
                 txt += "📂 No direct links found."
             
-            # NO AUTO DELETE, PROTECT CONTENT ENABLED
             await update.message.reply_text(
                 txt,
                 parse_mode=constants.ParseMode.HTML,
@@ -649,6 +665,35 @@ class BotHandlers:
             await update.message.reply_text(
                 f"🎁 <b>Trial Active!</b> Sending 3 samples...\n"
                 f"⚠️ <i>Auto-delete in {Config.AUTO_DELETE_SECONDS // 60} mins.</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+            for vid in videos[:3]:
+                try:
+                    msg = await context.bot.send_video(
+                        chat_id=user.id,
+                        video=vid,
+                        caption=f"🎥 {course['name'].upper()} (Trial)",
+                        protect_content=True
+                    )
+                    context.job_queue.run_once(
+                        cls.auto_delete_task,
+                        Config.AUTO_DELETE_SECONDS,
+                        chat_id=user.id,
+                        data=msg.message_id
+                    )
+                except Exception as e:
+                    logging.error(f"Video Send Fail: {e}")
+            
+            await update.message.reply_text(f"💎 Unlock Full Access: /buy")
+
+        # 3. FREE USER EXPERIENCE
+        else:
+            await update.message.reply_text(
+                f"🚫 <b>LOCKED: {course['name'].upper()}</b>\n\n"
+                f"💰 Price: ₹{Config.PREMIUM_PRICE}/-\n"
+                f"🔓 <b>Get Free Trial:</b> Refer {Config.REFERRAL_THRESHOLD} friends.\n"
+                f"🔗 Link: <code>https://t.me/{context.bot.username}?start={user.id}</code>",
                 parse_mode=constants.ParseMode.HTML
             )
 
